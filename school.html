@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ウェブプロキシ - 学校側</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>ウェブプロキシ - 学校側</h1>
+
+        <div class="input-group">
+            <label for="homePeerId">家のPeer ID:</label>
+            <input type="text" id="homePeerId" placeholder="家側のPeer IDを入力してください">
+        </div>
+
+        <div class="input-group">
+            <label for="url">URL:</label>
+            <input type="text" id="url" placeholder="アクセスしたいURLを入力してください">
+        </div>
+
+        <button id="connectBtn">接続</button>
+        <button id="fetchBtn" disabled>データ取得</button>
+
+        <div id="statusMsg" class="status disconnected">未接続</div>
+
+        <div id="loadingIndicator">
+            <div class="spinner"></div>
+            <span id="loadingText">データ取得中...</span>
+        </div>
+
+        <div id="progressContainer" class="progress-container">
+            <div id="progressBar" class="progress-bar">
+                <div id="progressText" class="progress-text">0%</div>
+            </div>
+        </div>
+
+        <div id="processingSteps" class="processing-steps">
+            <div id="stepReceiving" class="step step-pending">
+                <span class="step-icon">◯</span>データ受信
+            </div>
+            <div id="stepParsing" class="step step-pending">
+                <span class="step-icon">◯</span>HTML解析
+            </div>
+            <div id="stepProcessing" class="step step-pending">
+                <span class="step-icon">◯</span>リンク処理
+            </div>
+            <div id="stepRendering" class="step step-pending">
+                <span class="step-icon">◯</span>ページレンダリング
+            </div>
+        </div>
+
+        <div id="resultContainer">
+            <div class="tabs">
+                <div class="tab active" data-tab="preview">プレビュー</div>
+                <div class="tab" data-tab="source">ソース</div>
+            </div>
+
+            <div id="metaInfo" class="meta-info" style="display:none">
+                <div class="meta-row">
+                    <div class="meta-label">URL:</div>
+                    <div id="metaUrl" class="meta-value"></div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">ステータス:</div>
+                    <div id="metaStatus" class="meta-value"></div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">タイトル:</div>
+                    <div id="metaTitle" class="meta-value"></div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">Content-Type:</div>
+                    <div id="metaContentType" class="meta-value"></div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">リソース数:</div>
+                    <div id="metaResourceCount" class="meta-value">0</div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">処理時間:</div>
+                    <div id="metaProcessingTime" class="meta-value">-</div>
+                </div>
+                <div class="meta-row">
+                    <div class="meta-label">クライアント処理:</div>
+                    <div id="metaClientProcessing" class="meta-value">-</div>
+                </div>
+            </div>
+
+            <div class="control-buttons">
+                <button id="refreshPageBtn" style="display:none;">ページを更新</button>
+                <button id="copySourceBtn" style="display:none;">ソースをコピー</button>
+                <button id="backBtn" style="display:none;">戻る</button>
+                <button id="forwardBtn" style="display:none;">進む</button>
+            </div>
+
+            <div id="previewTab" class="tab-content active">
+                <iframe id="previewFrame" sandbox="allow-same-origin allow-scripts"></iframe>
+            </div>
+
+            <div id="sourceTab" class="tab-content">
+                <textarea id="sourceContent" readonly></textarea>
+            </div>
+        </div>
+    </div>
+
+    <!-- HTMLパーサーワーカー -->
+    <script id="htmlParserWorker" type="javascript/worker">
+        // Web Worker内のコード
+        self.onmessage = function(e) {
+            const { type, data } = e.data;
+
+            if (type === 'parseHTML') {
+                try {
+                    // HTMLパース処理開始
+                    self.postMessage({ type: 'status', status: 'parsing' });
+
+                    const { html, url, metaData } = data;
+
+                    // DOMParserはWeb Workerで使用できないため、正規表現で簡易的にリンクを抽出
+                    const linkPattern = /<a\s+(?:[^>]*?\s+)?href=["']([^"']*)["'][^>]*>(.*?)<\/a>/gi;
+                    const links = [];
+                    let match;
+
+                    while ((match = linkPattern.exec(html)) !== null) {
+                        links.push({
+                            href: match[1],
+                            text: match[2].replace(/<[^>]*>/g, '') // タグを除去
+                        });
+                    }
+
+                    // base要素を追加または更新
+                    let processedHtml = html;
+                    if (processedHtml.includes('<base')) {
+                        processedHtml = processedHtml.replace(/<base[^>]*>/i, `<base href="${url}">`);
+                    } else {
+                        processedHtml = processedHtml.replace(/<head[^>]*>/i, `<head><base href="${url}">`);
+                    }
+
+                    // カスタムスクリプトを挿入して、リンククリックを捕捉
+                    const linkInterceptorScript = `
+                    <script>
+                    (function() {
+                        document.addEventListener('click', function(e) {
+                            const link = e.target.closest('a');
+                            if (link && link.href) {
+                                e.preventDefault();
+                                window.parent.postMessage({
+                                    type: 'linkClicked',
+                                    url: link.href
+                                }, '*');
+                            }
+                        });
+                    })();
+                    <\/script>
+                    `;
+
+                    // </body>タグの前にスクリプトを挿入
+                    processedHtml = processedHtml.replace('</body>', `${linkInterceptorScript}</body>`);
+
+                    // 処理完了
+                    self.postMessage({
+                        type: 'result',
+                        processedHtml,
+                        links,
+                        url,
+                        metaData
+                    });
+
+                } catch (error) {
+                    self.postMessage({
+                        type: 'error',
+                        error: error.message
+                    });
+                }
+            }
+        };
+    </script>
+
+    <script>
+        // グローバル変数
+        let peer;
+        let conn;
+        let myPeerId;
+        let currentUrl = '';
+        let currentHtmlContent = '';
+        let htmlParserWorker = null;
+        let clientProcessingStart = 0;
+
+        // 履歴管理
+        let history = [];
+        let currentHistoryIndex = -1;
+
+        // DOM要素
+        const homePeerIdInput = document.getElementById('homePeerId');
+        const urlInput = document.getElementById('url');
+        const connectBtn = document.getElementById('connectBtn');
+        const fetchBtn = document.getElementById('fetchBtn');
+        const statusMsg = document.getElementById('statusMsg');
+        const previewFrame = document.getElementById('previewFrame');
+        const sourceContent = document.getElementById('sourceContent');
+        const metaInfo = document.getElementById('metaInfo');
+        const metaUrl = document.getElementById('metaUrl');
+        const metaStatus = document.getElementById('metaStatus');
+        const metaTitle = document.getElementById('metaTitle');
+        const metaContentType = document.getElementById('metaContentType');
+        const metaResourceCount = document.getElementById('metaResourceCount');
+        const metaProcessingTime = document.getElementById('metaProcessingTime');
+        const metaClientProcessing = document.getElementById('metaClientProcessing');
+        const refreshPageBtn = document.getElementById('refreshPageBtn');
+        const copySourceBtn = document.getElementById('copySourceBtn');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const backBtn = document.getElementById('backBtn');
+        const forwardBtn = document.getElementById('forwardBtn');
+        const processingSteps = document.getElementById('processingSteps');
+        const stepReceiving = document.getElementById('stepReceiving');
+        const stepParsing = document.getElementById('stepParsing');
+        const stepProcessing = document.getElementById('stepProcessing');
+        const stepRendering = document.getElementById('stepRendering');
+
+        // Web Workerの初期化
+        function initHtmlParserWorker() {
+            // 既存のワーカーを終了
+            if (htmlParserWorker) {
+                htmlParserWorker.terminate();
+            }
+
+            // Web Workerのコードを取得
+            const workerScript = document.getElementById('htmlParserWorker').textContent;
+            const blob = new Blob([workerScript], { type: 'text/javascript' });
+            const workerUrl = URL.createObjectURL(blob);
+
+            // ワーカーを作成
+            htmlParserWorker = new Worker(workerUrl);
+
+            // ワーカーからのメッセージを処理
+            htmlParserWorker.onmessage = function (e) {
+                const { type, status, processedHtml, links, url, metaData, error } = e.data;
+
+                if (type === 'status') {
+                    if (status === 'parsing') {
+                        updateProcessingStep('parsing');
+                    }
+                }
+                else if (type === 'result') {
+                    updateProcessingStep('processing');
+
+                    // 処理されたHTMLをiframeに表示
+                    previewFrame.srcdoc = processedHtml;
+
+                    // メタデータを更新
+                    currentUrl = url;
+
+                    // レンダリング完了待ち
+                    previewFrame.onload = function () {
+                        updateProcessingStep('rendering');
+
+                        // 処理時間を計算
+                        const clientProcessingEnd = performance.now();
+                        const clientProcessingTime = (clientProcessingEnd - clientProcessingStart) / 1000;
+                        metaClientProcessing.textContent = `${clientProcessingTime.toFixed(2)}秒`;
+
+                        setTimeout(function () {
+                            updateProcessingStep('complete');
+                            processingSteps.style.display = 'none';
+                        }, 500);
+                    };
+
+                    // イベントリスナーを設定（リンククリック用）
+                    window.addEventListener('message', handleIframeMessage);
+                }
+                else if (type === 'error') {
+                    console.error('HTMLパーサーエラー:', error);
+                    statusMsg.textContent = `HTML処理エラー: ${error}`;
+                    loadingIndicator.style.display = 'none';
+                    progressContainer.style.display = 'none';
+                    processingSteps.style.display = 'none';
+                }
+            };
+
+            htmlParserWorker.onerror = function (error) {
+                console.error('Web Workerエラー:', error);
+                statusMsg.textContent = 'HTML処理中にエラーが発生しました';
+                loadingIndicator.style.display = 'none';
+                progressContainer.style.display = 'none';
+                processingSteps.style.display = 'none';
+            };
+        }
+
+        // iframe内のメッセージハンドラ
+        function handleIframeMessage(event) {
+            const { type, url } = event.data;
+
+            if (type === 'linkClicked') {
+                let clickedUrl = url;
+
+                // 相対URLの場合は絶対URLに変換
+                if (!clickedUrl.startsWith('http')) {
+                    const baseUrl = new URL(currentUrl);
+                    clickedUrl = new URL(clickedUrl, baseUrl).href;
+                }
+
+                // URLを設定して新しいページをロード
+                urlInput.value = clickedUrl;
+                fetchData();
+            }
+        }
+
+        // 処理ステップの更新
+        function updateProcessingStep(step) {
+            // すべてのステップをリセット
+            stepReceiving.className = 'step step-pending';
+            stepParsing.className = 'step step-pending';
+            stepProcessing.className = 'step step-pending';
+            stepRendering.className = 'step step-pending';
+
+            stepReceiving.querySelector('.step-icon').textContent = '◯';
+            stepParsing.querySelector('.step-icon').textContent = '◯';
+            stepProcessing.querySelector('.step-icon').textContent = '◯';
+            stepRendering.querySelector('.step-icon').textContent = '◯';
+
+            // 現在のステップまでを更新
+            if (step === 'receiving' || step === 'complete') {
+                stepReceiving.className = 'step step-completed';
+                stepReceiving.querySelector('.step-icon').textContent = '✓';
+            } else if (step === 'parsing') {
+                stepReceiving.className = 'step step-completed';
+                stepParsing.className = 'step step-active';
+                stepReceiving.querySelector('.step-icon').textContent = '✓';
+            } else if (step === 'processing') {
+                stepReceiving.className = 'step step-completed';
+                stepParsing.className = 'step step-completed';
+                stepProcessing.className = 'step step-active';
+                stepReceiving.querySelector('.step-icon').textContent = '✓';
+                stepParsing.querySelector('.step-icon').textContent = '✓';
+            } else if (step === 'rendering') {
+                stepReceiving.className = 'step step-completed';
+                stepParsing.className = 'step step-completed';
+                stepProcessing.className = 'step step-completed';
+                stepRendering.className = 'step step-active';
+                stepReceiving.querySelector('.step-icon').textContent = '✓';
+                stepParsing.querySelector('.step-icon').textContent = '✓';
+                stepProcessing.querySelector('.step-icon').textContent = '✓';
+            }
+
+            if (step === 'complete') {
+                stepReceiving.className = 'step step-completed';
+                stepParsing.className = 'step step-completed';
+                stepProcessing.className = 'step step-completed';
+                stepRendering.className = 'step step-completed';
+                stepReceiving.querySelector('.step-icon').textContent = '✓';
+                stepParsing.querySelector('.step-icon').textContent = '✓';
+                stepProcessing.querySelector('.step-icon').textContent = '✓';
+                stepRendering.querySelector('.step-icon').textContent = '✓';
+            }
+        }
+
+        // タブ切り替え
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                // すべてのタブをinactive
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+                // クリックしたタブをactive
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab + 'Tab').classList.add('active');
+
+                // ソースタブが選択された場合にコピーボタンを表示
+                if (tab.dataset.tab === 'source') {
+                    copySourceBtn.style.display = 'inline-block';
+                } else {
+                    copySourceBtn.style.display = 'none';
+                }
+            });
+        });
+
+        // Peer接続の初期化
+        function initPeer() {
+            peer = new Peer();
+
+            peer.on('open', (id) => {
+                myPeerId = id;
+                statusMsg.textContent = `学校側のPeer ID: ${id}`;
+                statusMsg.className = 'status disconnected';
+            });
+
+            peer.on('error', (err) => {
+                console.error(err);
+                statusMsg.textContent = `エラー: ${err.message}`;
+                statusMsg.className = 'status disconnected';
+                connectBtn.disabled = false;
+                fetchBtn.disabled = true;
+                loadingIndicator.style.display = 'none';
+                progressContainer.style.display = 'none';
+                processingSteps.style.display = 'none';
+            });
+        }
+
+        // 家側PCへの接続
+        function connectToHome() {
+            const homePeerId = homePeerIdInput.value.trim();
+            if (!homePeerId) {
+                alert('家側のPeer IDを入力してください');
+                return;
+            }
+
+            statusMsg.textContent = '接続中...';
+            statusMsg.className = 'status loading';
+            connectBtn.disabled = true;
+
+            conn = peer.connect(homePeerId);
+
+            conn.on('open', () => {
+                statusMsg.textContent = '接続成功！';
+                statusMsg.className = 'status connected';
+                connectBtn.disabled = true;
+                fetchBtn.disabled = false;
+                backBtn.style.display = 'inline-block';
+                forwardBtn.style.display = 'inline-block';
+                updateNavigationButtons();
+
+                // Web Workerの初期化
+                initHtmlParserWorker();
+
+                conn.on('data', (data) => {
+                    if (data.type === 'result') {
+                        clientProcessingStart = performance.now();
+                        processResult(data.content);
+                        statusMsg.textContent = '取得完了';
+                        statusMsg.className = 'status connected';
+                        fetchBtn.disabled = false;
+                        loadingIndicator.style.display = 'none';
+                        refreshPageBtn.style.display = 'inline-block';
+                    } else if (data.type === 'progress') {
+                        // 進捗状況を更新
+                        updateProgress(data.percent);
+                    }
+                });
+            });
+
+            conn.on('close', () => {
+                statusMsg.textContent = '接続が切断されました';
+                statusMsg.className = 'status disconnected';
+                connectBtn.disabled = false;
+                fetchBtn.disabled = true;
+                backBtn.style.display = 'none';
+                forwardBtn.style.display = 'none';
+            });
+
+            conn.on('error', (err) => {
+                console.error(err);
+                statusMsg.textContent = `接続エラー: ${err.message}`;
+                statusMsg.className = 'status disconnected';
+                connectBtn.disabled = false;
+                fetchBtn.disabled = true;
+                loadingIndicator.style.display = 'none';
+                progressContainer.style.display = 'none';
+                processingSteps.style.display = 'none';
+            });
+        }
+
+        // 進捗状況の更新
+        function updateProgress(percent) {
+            progressContainer.style.display = 'block';
+            progressBar.style.width = `${percent}%`;
+            progressText.textContent = `${percent}%`;
+        }
+
+        // データ取得リクエストの送信
+        function fetchData() {
+            const url = urlInput.value.trim();
+            if (!url) {
+                alert('URLを入力してください');
+                return;
+            }
+
+            // 履歴に追加
+            if (currentUrl !== url) {
+                // 新しいURLの場合、現在位置より後の履歴を削除
+                if (currentHistoryIndex >= 0) {
+                    history = history.slice(0, currentHistoryIndex + 1);
+                }
+                history.push(url);
+                currentHistoryIndex = history.length - 1;
+                updateNavigationButtons();
+            }
+
+            currentUrl = url;
+            statusMsg.textContent = 'データ取得中...';
+            statusMsg.className = 'status loading';
+            fetchBtn.disabled = true;
+            loadingIndicator.style.display = 'block';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressText.textContent = '0%';
+            processingSteps.style.display = 'block';
+            updateProcessingStep('receiving');
+
+            // iframeとテキストエリアをクリア
+            previewFrame.srcdoc = '';
+            sourceContent.value = '';
+            metaInfo.style.display = 'none';
+            refreshPageBtn.style.display = 'none';
+
+            conn.send({
+                type: 'fetch',
+                url: url
+            });
+        }
+
+        // ソースコードをクリップボードにコピー
+        function copySourceToClipboard() {
+            sourceContent.select();
+            document.execCommand('copy');
+            alert('ソースコードをクリップボードにコピーしました');
+        }
+
+        // 履歴ナビゲーションボタンの更新
+        function updateNavigationButtons() {
+            backBtn.disabled = currentHistoryIndex <= 0;
+            forwardBtn.disabled = currentHistoryIndex >= history.length - 1;
+        }
+
+        // 履歴で戻る
+        function navigateBack() {
+            if (currentHistoryIndex > 0) {
+                currentHistoryIndex--;
+                urlInput.value = history[currentHistoryIndex];
+                fetchData();
+                updateNavigationButtons();
+            }
+        }
+
+        // 履歴で進む
+        function navigateForward() {
+            if (currentHistoryIndex < history.length - 1) {
+                currentHistoryIndex++;
+                urlInput.value = history[currentHistoryIndex];
+                fetchData();
+                updateNavigationButtons();
+            }
+        }
+
+        // 結果の処理
+        function processResult(content) {
+            if (content.startsWith('エラー:')) {
+                // エラーメッセージの表示
+                sourceContent.value = content;
+                previewFrame.srcdoc = `<html><body><h1>エラー</h1><p>${content}</p></body></html>`;
+                processingSteps.style.display = 'none';
+                return;
+            }
+
+            // メタデータとHTMLコンテンツを抽出
+            const metaDataMatch = content.match(/URL: (.*?)\nステータス: (.*?)\nタイトル: (.*?)\nコンテンツタイプ: (.*?)\nエンコーディング: (.*?)\nリソース数: (.*?)\n処理時間: (.*?)\n\n--- HTML コンテンツ ---\n([\s\S]*)/);
+
+            if (metaDataMatch) {
+                const [, url, status, title, contentType, encoding, resourceCount, processingTime, htmlContent] = metaDataMatch;
+
+                // メタデータを表示
+                metaUrl.textContent = url;
+                metaStatus.textContent = status;
+                metaTitle.textContent = title;
+                metaContentType.textContent = contentType;
+                metaResourceCount.textContent = resourceCount;
+                metaProcessingTime.textContent = processingTime;
+                metaInfo.style.display = 'block';
+
+                // 現在のHTMLコンテンツを保存
+                currentHtmlContent = htmlContent;
+
+                // ソースコードを表示
+                sourceContent.value = htmlContent;
+
+                // Web Workerを使用してHTMLを並行処理
+                const metaDataObj = {
+                    url,
+                    status,
+                    title,
+                    contentType,
+                    encoding,
+                    resourceCount,
+                    processingTime
+                };
+
+                // HTMLパーサーWorkerにタスクを送信
+                htmlParserWorker.postMessage({
+                    type: 'parseHTML',
+                    data: {
+                        html: htmlContent,
+                        url: url,
+                        metaData: metaDataObj
+                    }
+                });
+            } else {
+                // メタデータの抽出に失敗した場合
+                processingSteps.style.display = 'none';
+                sourceContent.value = content;
+                previewFrame.srcdoc = `<html><body><pre>${content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre></body></html>`;
+            }
+        }
+
+        // ページを更新
+        function refreshPage() {
+            if (currentUrl) {
+                fetchData();
+            }
+        }
+
+        // イベントリスナーの設定
+        document.addEventListener('DOMContentLoaded', () => {
+            initPeer();
+
+            connectBtn.addEventListener('click', connectToHome);
+            fetchBtn.addEventListener('click', fetchData);
+            refreshPageBtn.addEventListener('click', refreshPage);
+            copySourceBtn.addEventListener('click', copySourceToClipboard);
+            backBtn.addEventListener('click', navigateBack);
+            forwardBtn.addEventListener('click', navigateForward);
+        });
+    </script>
+</body>
+</html>
