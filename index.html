@@ -6,6 +6,7 @@
     <title>ウェブプロキシ - 学校側</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -87,6 +88,10 @@
                     <div class="meta-label">クライアント処理:</div>
                     <div id="metaClientProcessing" class="meta-value">-</div>
                 </div>
+                <div class="meta-row">
+                    <div class="meta-label">圧縮率:</div>
+                    <div id="metaCompression" class="meta-value">-</div>
+                </div>
             </div>
 
             <div class="control-buttons">
@@ -124,6 +129,7 @@
             metaResourceCount: document.getElementById('metaResourceCount'),
             metaProcessingTime: document.getElementById('metaProcessingTime'),
             metaClientProcessing: document.getElementById('metaClientProcessing'),
+            metaCompression: document.getElementById('metaCompression'),
             refreshPageBtn: document.getElementById('refreshPageBtn'),
             copySourceBtn: document.getElementById('copySourceBtn'),
             loadingIndicator: document.getElementById('loadingIndicator'),
@@ -151,119 +157,163 @@
         let processingStart = 0;
         let isProcessing = false;
         let fetchTimeout = null;
-        let receivedData = ""; // 受信データを格納する変数
+        let decompressWorker = null; // 解凍ワーカー
+
+        // 圧縮データを解凍する Web Worker
+        function initDecompressWorker() {
+            const workerCode = `
+                    importScripts('https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js');
+
+                    self.addEventListener('message', function(e) {
+                        try {
+                            const compressed = e.data.data;
+
+                            // Uint8Array に変換
+                            const binaryString = atob(compressed);
+                            const len = binaryString.length;
+                            const bytes = new Uint8Array(len);
+
+                            for (let i = 0; i < len; i++) {
+                                bytes[i] = binaryString.charCodeAt(i);
+                            }
+
+                            // 解凍
+                            const decompressed = pako.inflate(bytes, { to: 'string' });
+
+                            // 圧縮率計算
+                            const compressionRatio = (100 - (compressed.length / decompressed.length * 100)).toFixed(2);
+
+                            self.postMessage({
+                                success: true,
+                                data: decompressed,
+                                originalSize: decompressed.length,
+                                compressedSize: compressed.length,
+                                compressionRatio: compressionRatio
+                            });
+                        } catch (error) {
+                            self.postMessage({
+                                success: false,
+                                error: error.message || 'Unknown decompression error'
+                            });
+                        }
+                    });
+                `;
+
+            const blob = new Blob([workerCode], { type: 'application/javascript' });
+            decompressWorker = new Worker(URL.createObjectURL(blob));
+        }
 
         // Web Worker の作成 (HTMLの処理を別スレッドで行う)
         const htmlProcessorWorker = new Worker(URL.createObjectURL(new Blob([`
-            // HTMLプロセッサーワーカー
-            self.addEventListener('message', function(e) {
-                const { html, baseUrl } = e.data;
-                
-                // base要素を追加または更新
-                let processedHtml = html;
-                if (processedHtml.includes('<base')) {
-                    processedHtml = processedHtml.replace(/<base[^>]*>/i, \`<base href="\${baseUrl}">\`);
-                } else {
-                    processedHtml = processedHtml.replace(/<head[^>]*>/i, \`<head><base href="\${baseUrl}">\`);
-                }
+                // HTMLプロセッサーワーカー
+                self.addEventListener('message', function(e) {
+                    const { html, baseUrl } = e.data;
 
-                // イベント捕捉スクリプトを挿入
-                const script = \`
-                <script>
-                // リンククリック処理
-                document.addEventListener('click', function(e) {
-                    const link = e.target.closest('a');
-                    if (link && link.href) {
-                        e.preventDefault();
-                        window.parent.postMessage({type:'linkClicked',url:link.href}, '*');
-                    }
-                });
-
-                // フォーム送信処理
-                document.addEventListener('submit', function(e) {
-                    e.preventDefault();
-                    const form = e.target;
-                    
-                    // フォームデータの収集
-                    const formData = new FormData(form);
-                    const data = {};
-                    for (let [key, value] of formData.entries()) {
-                        data[key] = value;
-                    }
-                    
-                    // 送信先URLの取得
-                    let submitUrl = form.action || window.location.href;
-                    
-                    // GETリクエストの場合はURLパラメータを構築
-                    if (form.method.toLowerCase() === 'get') {
-                        const params = new URLSearchParams();
-                        for (let [key, value] of formData.entries()) {
-                            params.append(key, value);
-                        }
-                        submitUrl = submitUrl.split('?')[0] + '?' + params.toString();
-                        window.parent.postMessage({type:'linkClicked',url:submitUrl}, '*');
+                    // base要素を追加または更新
+                    let processedHtml = html;
+                    if (processedHtml.includes('<base')) {
+                        processedHtml = processedHtml.replace(/<base[^>]*>/i, \`<base href="\${baseUrl}">\`);
                     } else {
-                        // POSTフォームの場合はPOST情報も送信（現在は対応しない - GETとして処理）
-                        window.parent.postMessage({type:'linkClicked',url:submitUrl}, '*');
+                        processedHtml = processedHtml.replace(/<head[^>]*>/i, \`<head><base href="\${baseUrl}">\`);
                     }
-                });
-                
-                // ウィンドウの場所変更イベントをキャプチャ
-                const originalPushState = history.pushState;
-                const originalReplaceState = history.replaceState;
-                
-                history.pushState = function() {
-                    originalPushState.apply(this, arguments);
-                    notifyLocationChange();
-                };
-                
-                history.replaceState = function() {
-                    originalReplaceState.apply(this, arguments);
-                    notifyLocationChange();
-                };
-                
-                window.addEventListener('popstate', function() {
-                    notifyLocationChange();
-                });
-                
-                // location.hrefの変更を監視する
-                let lastUrl = location.href;
-                setInterval(function() {
-                    if (lastUrl !== location.href) {
-                        lastUrl = location.href;
+
+                    // イベント捕捉スクリプトを挿入
+                    const script = \`
+                    <script>
+                    // リンククリック処理
+                    document.addEventListener('click', function(e) {
+                        const link = e.target.closest('a');
+                        if (link && link.href) {
+                            e.preventDefault();
+                            window.parent.postMessage({type:'linkClicked',url:link.href}, '*');
+                        }
+                    });
+
+                    // フォーム送信処理
+                    document.addEventListener('submit', function(e) {
+                        e.preventDefault();
+                        const form = e.target;
+
+                        // フォームデータの収集
+                        const formData = new FormData(form);
+                        const data = {};
+                        for (let [key, value] of formData.entries()) {
+                            data[key] = value;
+                        }
+
+                        // 送信先URLの取得
+                        let submitUrl = form.action || window.location.href;
+
+                        // GETリクエストの場合はURLパラメータを構築
+                        if (form.method.toLowerCase() === 'get') {
+                            const params = new URLSearchParams();
+                            for (let [key, value] of formData.entries()) {
+                                params.append(key, value);
+                            }
+                            submitUrl = submitUrl.split('?')[0] + '?' + params.toString();
+                            window.parent.postMessage({type:'linkClicked',url:submitUrl}, '*');
+                        } else {
+                            // POSTフォームの場合はPOST情報も送信（現在は対応しない - GETとして処理）
+                            window.parent.postMessage({type:'linkClicked',url:submitUrl}, '*');
+                        }
+                    });
+
+                    // ウィンドウの場所変更イベントをキャプチャ
+                    const originalPushState = history.pushState;
+                    const originalReplaceState = history.replaceState;
+
+                    history.pushState = function() {
+                        originalPushState.apply(this, arguments);
                         notifyLocationChange();
+                    };
+
+                    history.replaceState = function() {
+                        originalReplaceState.apply(this, arguments);
+                        notifyLocationChange();
+                    };
+
+                    window.addEventListener('popstate', function() {
+                        notifyLocationChange();
+                    });
+
+                    // location.hrefの変更を監視する
+                    let lastUrl = location.href;
+                    setInterval(function() {
+                        if (lastUrl !== location.href) {
+                            lastUrl = location.href;
+                            notifyLocationChange();
+                        }
+                    }, 500);
+
+                    function notifyLocationChange() {
+                        window.parent.postMessage({
+                            type: 'locationChanged',
+                            url: location.href
+                        }, '*');
                     }
-                }, 500);
-                
-                function notifyLocationChange() {
-                    window.parent.postMessage({
-                        type: 'locationChanged',
-                        url: location.href
-                    }, '*');
-                }
-                <\\/script>
-                \`;
+                    <\\/script>
+                    \`;
 
-                // </body>タグの前にスクリプトを挿入
-                if (processedHtml.includes('</body>')) {
-                    processedHtml = processedHtml.replace('</body>', \`\${script}</body>\`);
-                } else {
-                    processedHtml += script;
-                }
+                    // </body>タグの前にスクリプトを挿入
+                    if (processedHtml.includes('</body>')) {
+                        processedHtml = processedHtml.replace('</body>', \`\${script}</body>\`);
+                    } else {
+                        processedHtml += script;
+                    }
 
-                // 処理結果を返す
-                self.postMessage(processedHtml);
-            });
-        `], { type: 'application/javascript' })));
+                    // 処理結果を返す
+                    self.postMessage(processedHtml);
+                });
+            `], { type: 'application/javascript' })));
 
         // 受信データパーサー (メタデータと本文に分割する関数)
         function parseReceivedData(content) {
             // 正規表現を使用してメタデータとHTMLコンテンツを分離
             const pattern = /URL: (.*?)\nステータス: (.*?)\nタイトル: (.*?)\nコンテンツタイプ: (.*?)\nエンコーディング: (.*?)\nリソース数: (.*?)\n処理時間: (.*?)\n\n--- HTML コンテンツ ---\n([\s\S]*)/;
             const match = content.match(pattern);
-            
+
             if (!match) return null;
-            
+
             return {
                 url: match[1],
                 status: match[2],
@@ -300,7 +350,7 @@
                 elements.stepProcessing,
                 elements.stepRendering
             ];
-            
+
             // アニメーションフレームを使用して非同期に更新
             requestAnimationFrame(() => {
                 steps.forEach(step => {
@@ -309,7 +359,7 @@
                 });
 
                 // 現在のステップをハイライト
-                switch(step) {
+                switch (step) {
                     case 'receiving':
                         elements.stepReceiving.className = 'step step-active';
                         break;
@@ -372,25 +422,25 @@
         }
 
         // Web Worker のメッセージハンドラ
-        htmlProcessorWorker.addEventListener('message', function(e) {
+        htmlProcessorWorker.addEventListener('message', function (e) {
             const processedHtml = e.data;
-            
+
             // iframeにHTMLを表示
             updateProcessingStep('rendering');
-            
+
             // 大きなHTMLをiframeに設定する前の最適化
             setTimeout(() => {
                 elements.previewFrame.srcdoc = processedHtml;
-                
+
                 // 処理時間計算
                 const clientProcessingEnd = performance.now();
                 const clientProcessingTime = (clientProcessingEnd - processingStart) / 1000;
                 elements.metaClientProcessing.textContent = `${clientProcessingTime.toFixed(2)}秒`;
-                
+
                 // UI要素の表示/非表示
                 elements.refreshPageBtn.style.display = 'inline-block';
                 elements.copySourceBtn.style.display = elements.tabs.querySelector('.tab.active').dataset.tab === 'source' ? 'inline-block' : 'none';
-                
+
                 // 処理完了
                 setTimeout(() => {
                     updateProcessingStep('complete');
@@ -410,8 +460,7 @@
             // 処理フラグとタイマー設定
             isProcessing = true;
             processingStart = performance.now();
-            receivedData = ""; // 受信データをリセット
-            
+
             // 取得タイムアウト設定（30秒）
             clearTimeout(fetchTimeout);
             fetchTimeout = setTimeout(() => {
@@ -457,6 +506,7 @@
             elements.metaInfo.style.display = 'none';
             elements.refreshPageBtn.style.display = 'none';
             elements.copySourceBtn.style.display = 'none';
+            elements.metaCompression.textContent = '-';
 
             // データ取得リクエスト送信
             conn.send({
@@ -465,11 +515,42 @@
             });
         }
 
+        // 圧縮データを処理
+        function processCompressedData(compressedContent) {
+            updateProcessingStep('parsing');
+
+            // 解凍ワーカーにデータを送信
+            decompressWorker.postMessage({
+                data: compressedContent
+            });
+        }
+
+        // Web Workerからの解凍完了メッセージを処理
+        function handleDecompressedData(result) {
+            if (!result.success) {
+                // 解凍エラーの場合
+                elements.sourceContent.value = 'データ解凍エラー: ' + result.error;
+                elements.previewFrame.srcdoc = `<html><body><h1>エラー</h1><p>データの解凍に失敗しました: ${result.error}</p></body></html>`;
+                elements.processingSteps.style.display = 'none';
+                isProcessing = false;
+                elements.fetchBtn.disabled = false;
+                elements.loadingIndicator.style.display = 'none';
+                elements.progressContainer.style.display = 'none';
+                return;
+            }
+
+            // 圧縮率表示
+            elements.metaCompression.textContent = `${result.compressionRatio}% (${(result.compressedSize / 1024).toFixed(2)}KB → ${(result.originalSize / 1024).toFixed(2)}KB)`;
+
+            // 解凍されたデータを処理
+            processResult(result.data);
+        }
+
         // 受信データの処理 (最適化版)
         function processResult(content) {
             // タイムアウトをクリア
             clearTimeout(fetchTimeout);
-            
+
             if (content.startsWith('エラー:')) {
                 // エラー表示
                 elements.sourceContent.value = content;
@@ -485,10 +566,10 @@
             // 非同期で処理を行うためにsetTimeoutを使用
             setTimeout(() => {
                 updateProcessingStep('parsing');
-                
+
                 // メタデータとHTMLを抽出
                 const parsedData = parseReceivedData(content);
-                
+
                 if (parsedData) {
                     // メタデータ更新（非同期で行う）
                     setTimeout(() => {
@@ -505,31 +586,31 @@
                     setTimeout(() => {
                         elements.sourceContent.value = parsedData.htmlContent;
                     }, 0);
-                    
+
                     // HTML処理と表示（Web Workerに処理を委譲）
                     updateProcessingStep('processing');
-                    
+
                     // Web Workerにデータを送信
                     htmlProcessorWorker.postMessage({
                         html: parsedData.htmlContent,
                         baseUrl: parsedData.url
                     });
-                    
+
                     // イベントリスナー設定
                     window.addEventListener('message', handleIframeMessage);
-                    
+
                 } else {
                     // メタデータ解析失敗
                     setTimeout(() => {
                         elements.sourceContent.value = content;
-                        
+
                         const escapedContent = content
                             .replace(/&/g, '&amp;')
                             .replace(/</g, '&lt;')
                             .replace(/>/g, '&gt;');
-                            
+
                         elements.previewFrame.srcdoc = `<html><body><pre>${escapedContent}</pre></body></html>`;
-                        
+
                         elements.loadingIndicator.style.display = 'none';
                         elements.progressContainer.style.display = 'none';
                         elements.processingSteps.style.display = 'none';
@@ -561,7 +642,7 @@
                 elements.statusMsg.className = 'status disconnected';
                 elements.connectBtn.disabled = false;
                 elements.fetchBtn.disabled = true;
-                
+
                 // エラー発生時にUIをリセット
                 elements.loadingIndicator.style.display = 'none';
                 elements.progressContainer.style.display = 'none';
@@ -603,7 +684,11 @@
 
                 // データ受信ハンドラ
                 conn.on('data', (data) => {
-                    if (data.type === 'result') {
+                    if (data.type === 'compressed_result') {
+                        // 圧縮データを処理
+                        processCompressedData(data.content);
+                    } else if (data.type === 'result') {
+                        // 非圧縮データを処理（後方互換性のため）
                         processResult(data.content);
                     } else if (data.type === 'progress') {
                         updateProgress(data.percent);
@@ -618,7 +703,7 @@
                 elements.fetchBtn.disabled = true;
                 elements.backBtn.style.display = 'none';
                 elements.forwardBtn.style.display = 'none';
-                
+
                 // 切断時にUIをリセット
                 if (isProcessing) {
                     elements.loadingIndicator.style.display = 'none';
@@ -634,7 +719,7 @@
                 elements.statusMsg.className = 'status disconnected';
                 elements.connectBtn.disabled = false;
                 elements.fetchBtn.disabled = true;
-                
+
                 // エラー発生時にUIをリセット
                 if (isProcessing) {
                     elements.loadingIndicator.style.display = 'none';
@@ -647,21 +732,29 @@
 
         // イベントリスナー設定
         document.addEventListener('DOMContentLoaded', () => {
+            // 解凍ワーカー初期化
+            initDecompressWorker();
+
+            // 解凍結果ハンドラ設定
+            decompressWorker.addEventListener('message', (e) => {
+                handleDecompressedData(e.data);
+            });
+
             // Peer接続初期化
             initPeer();
 
             // ボタンイベント
             elements.connectBtn.addEventListener('click', connectToHome);
             elements.fetchBtn.addEventListener('click', fetchData);
-            
+
             elements.refreshPageBtn.addEventListener('click', () => {
                 if (currentUrl) fetchData();
             });
-            
+
             elements.copySourceBtn.addEventListener('click', () => {
                 elements.sourceContent.select();
                 document.execCommand('copy');
-                
+
                 // コピー完了フィードバック
                 const originalText = elements.copySourceBtn.textContent;
                 elements.copySourceBtn.textContent = 'コピー完了!';
@@ -669,7 +762,7 @@
                     elements.copySourceBtn.textContent = originalText;
                 }, 1000);
             });
-            
+
             // 履歴ナビゲーション
             elements.backBtn.addEventListener('click', () => {
                 if (currentHistoryIndex > 0 && !isProcessing) {
@@ -679,7 +772,7 @@
                     updateNavigationButtons();
                 }
             });
-            
+
             elements.forwardBtn.addEventListener('click', () => {
                 if (currentHistoryIndex < history.length - 1 && !isProcessing) {
                     currentHistoryIndex++;
